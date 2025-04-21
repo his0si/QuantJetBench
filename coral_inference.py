@@ -9,8 +9,8 @@ from PIL import Image
 
 MODEL_PATHS = {
     'fp32': 'resnet_fp32.tflite',
-    'full_int8': 'resnet_full_int8.tflite',
-    'custom_mpq': 'resnet_custom_mpq.tflite'
+    'full_int8': 'resnet_full_int8_edgetpu.tflite',  # Edge TPU 컴파일된 모델
+    'custom_mpq': 'resnet_custom_mpq_edgetpu.tflite'  # Edge TPU 컴파일된 모델
 }
 
 def load_image():
@@ -30,9 +30,15 @@ def measure_inference(model_path, runs=100):
         size = input_size(interpreter)
 
         img = load_image().resize(size)
-        input_tensor = np.asarray(img).astype(np.uint8).reshape(1, size[0], size[1], 3)
-
+        
+        # 입력 타입에 따라 처리
         input_details = interpreter.get_input_details()
+        if input_details[0]['dtype'] == np.uint8:
+            input_tensor = np.asarray(img).astype(np.uint8)
+        else:
+            input_tensor = (np.asarray(img).astype(np.float32) / 255.0)
+        
+        input_tensor = input_tensor.reshape(1, size[0], size[1], 3)
         interpreter.set_tensor(input_details[0]['index'], input_tensor)
         interpreter.invoke()  # warmup
 
