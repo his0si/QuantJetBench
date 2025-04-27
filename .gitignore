@@ -38,3 +38,13 @@ var/
 # OS
 .DS_Store
 Thumbs.db
+
+# Large model and data files
+server/data/cifar-10-python.tar.gz
+server/resnet_full_qat_100percent_qat_saved_model/variables/variables.data-00000-of-00001
+server/resnet_hessian_percent_72percent_qat_saved_model/variables/variables.data-00000-of-00001
+server/resnet_hessian_qat_72percent_qat_saved_model/variables/variables.data-00000-of-00001
+server/resnet_hybrid_percent_70percent_qat_saved_model/variables/variables.data-00000-of-00001
+server/resnet_hybrid_qat_76percent_qat_saved_model/variables/variables.data-00000-of-00001
+server/resnet_l2_norm_percent_71percent_qat_saved_model/variables/variables.data-00000-of-00001
+server/resnet_l2norm_qat_71percent_qat_saved_model/variables/variables.data-00000-of-00001
