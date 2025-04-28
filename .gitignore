@@ -48,3 +48,6 @@ server/resnet_hybrid_percent_70percent_qat_saved_model/variables/variables.data-
 server/resnet_hybrid_qat_76percent_qat_saved_model/variables/variables.data-00000-of-00001
 server/resnet_l2_norm_percent_71percent_qat_saved_model/variables/variables.data-00000-of-00001
 server/resnet_l2norm_qat_71percent_qat_saved_model/variables/variables.data-00000-of-00001
+
+# CIFAR-10 dataset cache (over 100MB, do not commit)
+coral/cifar10_data/cifar-10-python.tar.gz
