@@ -3,15 +3,16 @@ import tensorflow as tf
 import tensorflow_model_optimization as tfmot
 from tensorflow.keras.datasets import cifar10
 import os
-import shutil # Added for cleaning up directories
+import shutil
 
 # --- Configuration ---
-FINETUNE_SIZE = 10000 # Increased: Use 10000 images for QAT fine-tuning (closer to full CIFAR)
-CALIB_SIZE = 1000     # Increased: Use 1000 images for PTQ and post-QAT TFLite calibration
-TEST_SIZE = 1000      # Keep test size reasonable for quick evaluation
-QAT_EPOCHS = 20       # Increased: Number of epochs for QAT fine-tuning (suggested >= 20)
-TARGET_QUANT_PERCENTAGE = 0.70 # Target 70% of parameters for selective QAT
+FINETUNE_SIZE = 45000 # Increased: Use 10000 images for QAT fine-tuning (closer to full CIFAR)
+CALIB_SIZE = 5000     # Increased: Use 1000 images for PTQ and post-QAT TFLite calibration
+TEST_SIZE = 10000      # Keep test size reasonable for quick evaluation
+QAT_EPOCHS = 5       # Increased: Number of epochs for QAT fine-tuning (suggested >= 20)
 QAT_LEARNING_RATE = 1e-4 # Reduced: Lower learning rate for QAT fine-tuning (suggested 1e-4 or 1e-5)
+TARGET_QUANT_PERCENTAGE = 0.70 # Target 70% of parameters for selective QAT (used by score methods)
+MIDDLE_EXCLUDE_PERCENT = 0.15 # Exclude ~15% of quantizable layers from start and end
 
 # --- Load Base Model (Keep as is) ---
 # Load saved FP32 model
@@ -72,6 +73,17 @@ except Exception as e:
 
 # --- Prepare Data (Modified for QAT fine-tuning and PTQ calibration) ---
 (x_train, y_train), (x_test, y_test) = cifar10.load_data()
+
+# --- NEW: Shuffle the training data ---
+print("Shuffling training data...")
+np.random.seed(42) # Optional: Set a seed for reproducibility
+shuffle_indices = np.random.permutation(len(x_train))
+x_train = x_train[shuffle_indices]
+y_train = y_train[shuffle_indices]
+print("Training data shuffled.")
+# --- End NEW ---
+
+
 x_train = x_train.astype(np.float32) / 255.0
 x_test = x_test.astype(np.float32) / 255.0
 
@@ -79,11 +91,12 @@ x_test = x_test.astype(np.float32) / 255.0
 # Ensure FINETUNE_SIZE + CALIB_SIZE does not exceed x_train length
 if FINETUNE_SIZE + CALIB_SIZE > len(x_train):
     print(f"Warning: FINETUNE_SIZE ({FINETUNE_SIZE}) + CALIB_SIZE ({CALIB_SIZE}) exceeds total training data size ({len(x_train)}). Adjusting sizes.")
-    FINETUNE_SIZE = len(x_train) - CALIB_SIZE # Maximize finetune size while keeping calib_size distinct
-    if FINETUNE_SIZE < 0: # If calib_size is already larger than total train data
-         CALIB_SIZE = len(x_train)
-         FINETUNE_SIZE = 0
-         print("Adjusted calib_size to total training data size, finetune_size is 0.")
+    CALIB_SIZE = min(CALIB_SIZE, len(x_train) - FINETUNE_SIZE) # Ensure calib_size fits after finetune
+    if CALIB_SIZE < 0:
+        FINETUNE_SIZE = len(x_train) # Use all data for finetuning if calib_size too big
+        CALIB_SIZE = 0
+    if FINETUNE_SIZE + CALIB_SIZE > len(x_train): # Re-check if sum still too big
+         FINETUNE_SIZE = len(x_train) - CALIB_SIZE # Final adjustment
 
 
 finetune_data = x_train[:FINETUNE_SIZE]
@@ -115,7 +128,7 @@ def convert_to_tflite(saved_model_path, output_path):
     """Converts a Keras SavedModel (PTQ or QAT) to Full INT8 TFLite."""
     if not os.path.isdir(saved_model_path):
         print(f"Error: Saved model directory not found: {saved_model_path}")
-        return False
+        return None # Return None on failure
 
     try:
         converter = tf.lite.TFLiteConverter.from_saved_model(saved_model_path)
@@ -142,17 +155,18 @@ def convert_to_tflite(saved_model_path, output_path):
 
         file_size_mb = os.path.getsize(output_path)/(1024*1024) if os.path.exists(output_path) else 0
         print(f"Saved TFLite model: {output_path} ({file_size_mb:.2f} MB)")
-        return True
+        return output_path # Return path on success
     except Exception as e:
         print(f"Error during TFLite conversion for {output_path}: {e}")
         import traceback
         traceback.print_exc()
-        return False
+        return None # Return None on failure
 
 
-# --- Helper: Fine-tune QAT model and convert to TFLite ---
-def finetune_and_convert_qat_model(qat_prepared_model, finetune_data, finetune_labels, test_data_eval, test_labels_eval, output_prefix):
-    """Fine-tunes a QAT-prepared model and converts it to TFLite."""
+# --- Helper: Fine-tune QAT model and Save Keras model ---
+# Modified to *only* fine-tune and save the Keras model, and return its test accuracy and path
+def finetune_and_save_qat_keras_model(qat_prepared_model, finetune_data, finetune_labels, test_data_eval, test_labels_eval, output_prefix):
+    """Fine-tunes a QAT-prepared model, evaluates Keras model, and saves it."""
     print(f"\n--- Starting QAT Fine-tuning for {output_prefix} ---")
 
     # QAT model must be compiled AFTER tfmot.quantization.keras.quantize_apply (or quantize_model)
@@ -165,11 +179,27 @@ def finetune_and_convert_qat_model(qat_prepared_model, finetune_data, finetune_l
     print("QAT model compiled with Adam optimizer and learning rate", QAT_LEARNING_RATE)
 
     # Unfreeze BN layers for QAT fine-tuning
-    print("Unfreezing BatchNormalization layers...")
+    # Note: In QAT, BN layers are replaced with QuantizeWrapperV2 containing BatchNormalization.
+    # We need to find the inner BN layer or unfreeze the wrapper if it handles training.
+    # Let's try unfreezing the wrapper itself and the inner layer if accessible.
+    print("Unfreezing BatchNormalization layers (and wrappers)...")
     for layer in qat_prepared_model.layers:
-        if isinstance(layer, tf.keras.layers.BatchNormalization):
-            layer.trainable = True
-            #print(f" - Unfrozen BN layer: {layer.name}") # Optional print
+        # Check for QuantizeWrapperV2 containing BN
+        if isinstance(layer, tfmot.quantization.keras.QuantizeWrapperV2):
+             if isinstance(layer.layer, tf.keras.layers.BatchNormalization):
+                 layer.trainable = True # Unfreeze wrapper
+                 layer.layer.trainable = True # Unfreeze inner BN
+                 #print(f" - Unfrozen BN wrapper+layer: {layer.name}")
+             else:
+                 # Unfreeze other wrappers as well, as they contain trainable quantizer parameters
+                 layer.trainable = True
+                 #print(f" - Unfrozen Wrapper: {layer.name}")
+        elif isinstance(layer, tf.keras.layers.BatchNormalization):
+             layer.trainable = True # Unfreeze standalone BN
+             #print(f" - Unfrozen standalone BN layer: {layer.name}")
+        # Add other trainable layers that are not quantized if needed, but QAT often traines only quantized parts
+        # For this script's purpose, we focus on BN which is critical for QAT convergence
+        # Original base_model.trainable_variables controls what was trainable initially
 
 
     print(f"Fine-tuning for {QAT_EPOCHS} epochs...")
@@ -183,12 +213,25 @@ def finetune_and_convert_qat_model(qat_prepared_model, finetune_data, finetune_l
             validation_data=(test_data_eval, test_labels_eval) # Added validation data
         )
         print("Fine-tuning complete.")
-        # You might want to print/log history.history['accuracy'][-1] etc.
+        # You might want to print/log history.history['val_accuracy'][-1] etc.
     except Exception as e:
         print(f"Error during QAT fine-tuning: {e}")
         import traceback
         traceback.print_exc()
-        return None # Return None if fine-tuning fails
+        return None, None # Return None for both path and Keras accuracy
+
+
+    # --- Evaluate QAT Keras Model (with Fake Quant) before Conversion ---
+    print(f"\n--- Evaluating {output_prefix} QAT Keras Model (with Fake Quant) ---")
+    try:
+        # Use the same evaluation data as the final TFLite evaluation
+        keras_loss, keras_accuracy = qat_prepared_model.evaluate(test_data_eval, test_labels_eval, verbose=0)
+        print(f"{output_prefix} QAT Keras Model Accuracy: {keras_accuracy*100:.2f}% ({int(keras_accuracy*len(test_labels_eval))}/{len(test_labels_eval)})")
+    except Exception as e:
+         print(f"Error evaluating {output_prefix} QAT Keras model: {e}")
+         import traceback
+         traceback.print_exc()
+         keras_accuracy = None # Mark accuracy as failed
 
 
     # Save the fine-tuned QAT Keras model
@@ -204,71 +247,53 @@ def finetune_and_convert_qat_model(qat_prepared_model, finetune_data, finetune_l
     try:
         qat_prepared_model.save(saved_qat_model_dir)
         print(f"Saved fine-tuned QAT Keras model: {saved_qat_model_dir}")
+        return saved_qat_model_dir, keras_accuracy # Return path to saved model and Keras accuracy
     except Exception as e:
         print(f"Error saving fine-tuned QAT model: {e}")
         # Clean up potentially partially created directory
         if os.path.exists(saved_qat_model_dir):
              shutil.rmtree(saved_qat_model_dir)
-        return None # Return None if saving fails
-
-    # Convert the fine-tuned QAT Keras model to TFLite (Full INT8)
-    tflite_qat_path = f'{output_prefix}_qat.tflite' # Add _qat suffix
-    success = convert_to_tflite(saved_qat_model_dir, tflite_qat_path)
-
-    # Clean up the saved Keras model directory after conversion (optional but good practice)
-    if os.path.exists(saved_qat_model_dir):
-         try:
-             shutil.rmtree(saved_qat_model_dir)
-             # print(f"Cleaned up saved Keras model directory: {saved_qat_model_dir}")
-         except Exception as clean_e:
-             print(f"Warning: Could not clean up saved Keras model directory {saved_qat_model_dir}: {clean_e}")
+        return None, keras_accuracy # Return None for path, but return Keras accuracy if available
 
 
-    if success:
-         return tflite_qat_path # Return the path to the created TFLite file
-    else:
-         return None
-
-# --- Helper Function for Percentage-Based Selection (Brought back) ---
+# --- Helper Function for Percentage-Based Selection ---
 def select_layers_by_percentage(model, score_dict, target_percentage=0.7, quantize_lowest=True):
     """
     Selects layers for quantization based on a score until a target percentage
-    of parameters is reached.
+    of parameters is reached. Used by score-based methods (L2, Hessian, Hybrid).
     """
-    quantizable_layers = []
-    total_quantizable_params = 0
+    quantizable_layers_with_scores = []
+    total_quantizable_params_with_scores = 0
 
-    # Identify layers that are typically quantizable and have parameters
+    # Identify layers that are typically quantizable and have parameters AND a score
     quantizable_types = (tf.keras.layers.Conv2D, tf.keras.layers.Dense, tf.keras.layers.DepthwiseConv2D, tf.keras.layers.Conv2DTranspose)
 
     for layer in model.layers:
         if isinstance(layer, quantizable_types):
              params = layer.count_params()
-             # Only consider layers with parameters
-             if params > 0:
-                  # Check if score exists for this layer. If not, it won't be considered for selection based on score.
-                  if layer.name in score_dict:
-                       quantizable_layers.append({
-                           'name': layer.name,
-                           'score': score_dict[layer.name],
-                           'params': params
-                       })
-                       total_quantizable_params += params
-                  # else: Warning about missing score is handled in scoring functions
+             # Only consider layers with parameters and ensure they have a score
+             if params > 0 and layer.name in score_dict:
+                  quantizable_layers_with_scores.append({
+                       'name': layer.name,
+                       'score': score_dict[layer.name],
+                       'params': params
+                   })
+                  total_quantizable_params_with_scores += params
+             # else: layers without params or score are not candidates for this selection method
 
 
-    if total_quantizable_params == 0:
-        print("No quantizable parameters with scores found for selection.")
+    if total_quantizable_params_with_scores == 0:
+        print("No quantizable parameters with scores found for selection by percentage.")
         return set(), 0.0
 
     # Sort layers based on score and the quantize_lowest flag
-    sorted_layers = sorted(quantizable_layers, key=lambda x: x['score'], reverse=not quantize_lowest)
+    sorted_layers = sorted(quantizable_layers_with_scores, key=lambda x: x['score'], reverse=not quantize_lowest)
 
-    target_params = total_quantizable_params * target_percentage
+    target_params = total_quantizable_params_with_scores * target_percentage
     selected_layers_set = set()
     accumulated_params = 0
 
-    print(f"\nTargeting {target_percentage*100:.1f}% ({int(target_params)}) of {total_quantizable_params} total quantizable parameters with scores.")
+    print(f"\nTargeting {target_percentage*100:.1f}% ({int(target_params)}) of {total_quantizable_params_with_scores} total quantizable parameters with scores.")
     print(f"Sorting layers by score ({'Ascending - quantizing lowest scores first' if quantize_lowest else 'Descending - quantizing highest scores first'})...")
 
     for layer_info in sorted_layers:
@@ -280,18 +305,22 @@ def select_layers_by_percentage(model, score_dict, target_percentage=0.7, quanti
              # Stop once target is reached or exceeded, but the last layer added might exceed the target
              break
 
-    actual_percentage = (accumulated_params / total_quantizable_params) if total_quantizable_params > 0 else 0
+    actual_percentage = (accumulated_params / total_quantizable_params_with_scores) if total_quantizable_params_with_scores > 0 else 0
     print(f"Selected {len(selected_layers_set)} layers for QAT based on percentage target.")
     print(f"Covered {accumulated_params} parameters ({actual_percentage*100:.2f}% of total quantizable parameters with scores).")
 
     return selected_layers_set, actual_percentage
 
-# --- Helper to get the annotated model for selective QAT (Brought back) ---
+# --- Helper to get the annotated model for selective QAT ---
 def get_annotated_model_selective(model, selected_layer_names):
      QuantAnnotate = tfmot.quantization.keras.quantize_annotate_layer
      def apply_quantization_based_on_selection(layer):
          # Check if the layer is quantizable and in the selected list
          quantizable_types = (tf.keras.layers.Conv2D, tf.keras.layers.Dense, tf.keras.layers.DepthwiseConv2D, tf.keras.layers.Conv2DTranspose)
+         # Also include BatchNormalization layers within QuantizeWrapperV2 if their preceding layer is selected
+         # Or more simply, annotate all quantizable layers (Conv, Dense, etc.) and let TFMOT handle BN
+         # A common pattern is to annotate Conv/Dense and TFMOT automatically handles BN folding/wrapping
+         # Let's stick to annotating the main quantizable types (Conv, Dense)
          if isinstance(layer, quantizable_types) and layer.name in selected_layer_names:
              # print(f"  -> Annotating {layer.name} for QAT (Selected)")
              return QuantAnnotate(layer)
@@ -307,7 +336,7 @@ def get_annotated_model_selective(model, selected_layer_names):
      return annotated_model
 
 
-# --- Prepare Full QAT Model (Corrected) ---
+# --- Prepare Full QAT Model ---
 def prepare_qat_full(model):
     """Applies QAT preparation to the entire model using quantize_model."""
     print(f"\n--- Starting Full QAT Preparation ---")
@@ -318,19 +347,18 @@ def prepare_qat_full(model):
         qat_model = tfmot.quantization.keras.quantize_model(model)
 
     print("Full QAT model prepared.")
-    # For Full QAT, the percentage is effectively 100% of quantizable layers
-    # Count total quantizable parameters in the original model for the 100% value
+    # For Full QAT, the percentage is effectively 100% of quantizable layers with params
     total_quantizable_params = 0
     quantizable_types = (tf.keras.layers.Conv2D, tf.keras.layers.Dense, tf.keras.layers.DepthwiseConv2D, tf.keras.layers.Conv2DTranspose)
     for layer in model.layers:
          if isinstance(layer, quantizable_types):
               total_quantizable_params += layer.count_params() if layer.count_params() > 0 else 0
 
-    # Return the model and 1.0 for 100% (and total params if needed, though not used in main)
+    # Return the model and 1.0 for 100% coverage of quantizable params with scores (all of them here)
     return qat_model, 1.0
 
 
-# --- Scoring Functions (Brought back and integrated into prepare functions) ---
+# --- Scoring Functions (Used by Selective Methods) ---
 # Define common quantizable types for score calculation and selection consistency
 QUANTIZABLE_SCORE_TYPES = (tf.keras.layers.Conv2D, tf.keras.layers.Dense, tf.keras.layers.DepthwiseConv2D, tf.keras.layers.Conv2DTranspose)
 
@@ -339,11 +367,9 @@ QUANTIZABLE_SCORE_TYPES = (tf.keras.layers.Conv2D, tf.keras.layers.Dense, tf.ker
 def prepare_qat_l2_percent(model, target_percentage=0.7):
     print(f"\n--- Starting L2 Norm Percentage Selective QAT Preparation ({target_percentage*100:.0f}%) ---")
     layer_scores = {}
-    # quantizable_layer_names = set() # Track layers we tried to score
 
     for layer in model.layers:
         if isinstance(layer, QUANTIZABLE_SCORE_TYPES):
-            # quantizable_layer_names.add(layer.name) # Not strictly needed here if score_dict build handles it
             weights = layer.get_weights()
             if weights and len(weights) > 0 and weights[0] is not None:
                 try:
@@ -351,7 +377,7 @@ def prepare_qat_l2_percent(model, target_percentage=0.7):
                     layer_scores[layer.name] = l2_norm
                 except Exception as e:
                     print(f"Could not process layer {layer.name} for L2 norm: {e}")
-            # else: Layers without weights[0] won't get a score and are implicitly skipped by select_layers
+            # Layers without weights[0] are implicitly not included in layer_scores
 
 
     selected_layers, actual_percentage = select_layers_by_percentage(
@@ -380,19 +406,20 @@ def prepare_qat_hessian_percent(model, target_percentage=0.7):
     # Use a small batch from the fine-tuning data for gradient calculation
     sample_images = finetune_data[:100] # Use a subset, smaller than full finetune_data
     sample_labels = finetune_labels[:100]
-    # quantizable_layer_names = set() # Not strictly needed here
     param_to_layer = {} # Map variable references to layer names
 
-    for layer in model.layers:
-        if isinstance(layer, QUANTIZABLE_SCORE_TYPES):
-            # quantizable_layer_names.add(layer.name) # Not strictly needed here
-            for param in layer.trainable_variables: # Get trainable variables *for this layer*
-                 param_to_layer[param.ref()] = layer.name # Use variable reference as key
+    # Identify quantizable layers with trainable variables that might contribute to scores
+    quantizable_layers_with_trainable_params = [
+        layer for layer in model.layers if isinstance(layer, QUANTIZABLE_SCORE_TYPES) and layer.trainable_variables
+    ]
 
-
-    if not param_to_layer:
-         print("No trainable variables in quantizable layers found to calculate Hessian scores.")
+    if not quantizable_layers_with_trainable_params:
+         print("No quantizable layers with trainable parameters found to calculate Hessian scores.")
          return None, None
+
+    for layer in quantizable_layers_with_trainable_params:
+        for param in layer.trainable_variables: # Get trainable variables *for this layer*
+             param_to_layer[param.ref()] = layer.name # Use variable reference as key
 
 
     try:
@@ -401,15 +428,14 @@ def prepare_qat_hessian_percent(model, target_percentage=0.7):
         _ = model(tf.random.uniform(shape=(1,) + model.input_shape[1:])) # Build the model if not already built
 
         with tf.GradientTape() as tape:
-            # Watch all trainable variables explicitly to be safe
-            # for var in model.trainable_variables:
-            #     tape.watch(var) # This can sometimes slow things down or be unnecessary
+            # Watch all trainable variables explicitly to be safe (optional but can help)
+            # tape.watch(model.trainable_variables)
             preds = model(sample_images, training=False) # Use training=False for inference path gradients
             loss = loss_fn(sample_labels, preds)
         print(f"Calculated loss: {loss.numpy()}")
 
-        # Get gradients for all trainable variables in the model
-        trainable_vars = model.trainable_variables
+        # Get gradients for trainable variables associated with the relevant layers
+        trainable_vars = [v for v in model.trainable_variables if v.ref() in param_to_layer]
         grads = tape.gradient(loss, trainable_vars)
 
         if grads is None or not any(g is not None for g in grads):
@@ -420,7 +446,7 @@ def prepare_qat_hessian_percent(model, target_percentage=0.7):
         for var, grad in zip(trainable_vars, grads):
             if grad is None: continue # Skip if gradient is None
 
-            layer_name = param_to_layer.get(var.ref()) # Use the pre-built map
+            layer_name = param_to_layer[var.ref()] # Get layer name from map
             # Ensure the variable belongs to a quantizable layer type we care about and has a mapping
             if layer_name is not None and layer_name in {l.name for l in model.layers if isinstance(l, QUANTIZABLE_SCORE_TYPES)}:
                  # Approximation: Mean of (Grad * Parameter)^2
@@ -429,18 +455,17 @@ def prepare_qat_hessian_percent(model, target_percentage=0.7):
                  score = tf.reduce_mean(tf.square(grad * var)).numpy()
                  # Aggregate score by layer name (a layer might have weight and bias)
                  layer_sens[layer_name] = layer_sens.get(layer_name, 0) + score
-            # else: print(f"Warning: Variable {var.name} not mapped to a quantizable layer.")
 
 
-        # Ensure all potential quantizable layers have a score entry, even if 0
-        all_potential_quantizable_names = {l.name for l in model.layers if isinstance(l, QUANTIZABLE_SCORE_TYPES)}
+        # Ensure all potential quantizable layers with trainable params have a score entry, even if grad was 0
+        all_potential_quantizable_names = {l.name for l in quantizable_layers_with_trainable_params}
         for name in all_potential_quantizable_names:
             if name not in layer_sens:
                  layer_sens[name] = 0 # Assign 0 if no variables or grad found for this layer
 
 
         if not layer_sens:
-            print("Error: Sensitivity scores dictionary is empty.")
+            print("Error: Sensitivity scores dictionary is empty after calculation.")
             return None, None
 
         selected_layers, actual_percentage = select_layers_by_percentage(
@@ -448,7 +473,7 @@ def prepare_qat_hessian_percent(model, target_percentage=0.7):
         )
 
         if not selected_layers:
-            print("No layers selected for Hessian QAT. Aborting preparation.")
+            print("No layers selected for Hessian QAT based on scores/percentage. Aborting preparation.")
             return None, None
 
         annotated_model = get_annotated_model_selective(model, selected_layers)
@@ -543,10 +568,13 @@ def prepare_qat_hybrid_percent(model, alpha=0.4, beta=0.4, gamma=0.2, target_per
     # Identify all potential quantizable layers for scoring
     all_potential_quantizable_names = {layer.name for layer in model.layers if isinstance(layer, QUANTIZABLE_SCORE_TYPES)}
     param_to_layer = {} # Map variable references to layer names for sensitivity
-    for layer in model.layers:
-         if isinstance(layer, QUANTIZABLE_SCORE_TYPES):
-              for param in layer.trainable_variables:
-                  param_to_layer[param.ref()] = layer.name
+    quantizable_layers_with_trainable_params = [
+        layer for layer in model.layers if isinstance(layer, QUANTIZABLE_SCORE_TYPES) and layer.trainable_variables
+    ]
+
+    for layer in quantizable_layers_with_trainable_params:
+         for param in layer.trainable_variables:
+              param_to_layer[param.ref()] = layer.name
 
 
     if not all_potential_quantizable_names:
@@ -609,7 +637,8 @@ def prepare_qat_hybrid_percent(model, alpha=0.4, beta=0.4, gamma=0.2, target_per
              preds = model(sample_data_scores, training=False)
              loss = loss_fn(sample_labels_scores, preds)
 
-        trainable_vars = model.trainable_variables
+        # Get gradients for trainable variables associated with the relevant layers
+        trainable_vars = [v for v in model.trainable_variables if v.ref() in param_to_layer]
         grads = tape.gradient(loss, trainable_vars)
 
         if grads is None or not any(g is not None for g in grads):
@@ -618,7 +647,7 @@ def prepare_qat_hybrid_percent(model, alpha=0.4, beta=0.4, gamma=0.2, target_per
             # Aggregate scores by module name using the pre-built map
             for var, grad in zip(trainable_vars, grads):
                 if grad is None: continue
-                layer_name = param_to_layer.get(var.ref()) # Use the map
+                layer_name = param_to_layer[var.ref()] # Use the map
                 # Ensure the variable belongs to a quantizable layer type we care about
                 if layer_name is not None and layer_name in all_potential_quantizable_names:
                     score = tf.reduce_mean(tf.square(grad * var)).numpy()
@@ -662,7 +691,7 @@ def prepare_qat_hybrid_percent(model, alpha=0.4, beta=0.4, gamma=0.2, target_per
     )
 
     if not selected_layers:
-        print("No layers selected for Hybrid QAT. Aborting preparation.")
+        print("No layers selected for Hybrid QAT based on scores/percentage. Aborting preparation.")
         return None, None
 
     annotated_model = get_annotated_model_selective(model, selected_layers)
@@ -674,11 +703,76 @@ def prepare_qat_hybrid_percent(model, alpha=0.4, beta=0.4, gamma=0.2, target_per
     return qat_model, actual_percentage
 
 
+# --- New Selective QAT Method: Quantize Middle Layers by Index ---
+def prepare_qat_middle_percent(model, exclude_percent=0.15):
+    """
+    Applies QAT to layers in the middle range, excluding a percentage
+    of quantizable layers from the start and end based on index.
+    """
+    print(f"\n--- Starting Middle Layers Selective QAT Preparation (Excluding ~{exclude_percent*100:.0f}% Start/End) ---")
+
+    quantizable_layers_ordered = []
+    total_quantizable_params = 0
+    quantizable_types = (tf.keras.layers.Conv2D, tf.keras.layers.Dense, tf.keras.layers.DepthwiseConv2D, tf.keras.layers.Conv2DTranspose)
+
+    # Identify quantizable layers in the model's sequential order that have parameters
+    for layer in model.layers:
+         if isinstance(layer, quantizable_types) and layer.count_params() > 0:
+              quantizable_layers_ordered.append(layer)
+              total_quantizable_params += layer.count_params()
+
+
+    num_quantizable_layers = len(quantizable_layers_ordered)
+    if num_quantizable_layers == 0:
+        print("No quantizable layers found with parameters for middle layer selection.")
+        return None, 0.0
+
+    num_exclude_start = int(num_quantizable_layers * exclude_percent)
+    num_exclude_end = int(num_quantizable_layers * exclude_percent)
+
+    # Ensure we don't exclude more layers than exist or exclude the entire model
+    # If exclusion is too high, quantize all layers instead of none/very few unexpectedly
+    if num_exclude_start + num_exclude_end >= num_quantizable_layers:
+        print(f"Warning: Exclusion percentages ({exclude_percent*100}% start + {exclude_percent*100}% end) are too high ({num_exclude_start + num_exclude_end} total layers to exclude) for {num_quantizable_layers} quantizable layers.")
+        print("Quantizing ALL quantizable layers instead.")
+        selected_layers_list = quantizable_layers_ordered # Select all
+        num_exclude_start = 0 # Reset exclusion counts for reporting
+        num_exclude_end = 0
+    else:
+         # Select layers in the middle by index
+         selected_layers_list = quantizable_layers_ordered[num_exclude_start : num_quantizable_layers - num_exclude_end]
+
+
+    selected_layer_names = {layer.name for layer in selected_layers_list}
+
+    if not selected_layer_names:
+         print("No layers selected for QAT after excluding start/end layers based on index. Aborting preparation.")
+         return None, 0.0
+
+    # Calculate actual parameter percentage covered by the selected layers
+    selected_params = sum(layer.count_params() for layer in selected_layers_list)
+    actual_percentage = (selected_params / total_quantizable_params) if total_quantizable_params > 0 else 0
+
+    print(f"Selected {len(selected_layers_list)} layers for QAT (indices {num_exclude_start} to {num_quantizable_layers - num_exclude_end - 1 if num_quantizable_layers > 0 else -1}).")
+    print(f"Covered {selected_params} parameters ({actual_percentage*100:.2f}% of total quantizable parameters with scores).")
+
+
+    # Annotate the model based on the selected layer names
+    annotated_model = get_annotated_model_selective(model, selected_layer_names)
+
+    # Apply quantization to get the QAT-prepared model
+    with tfmot.quantization.keras.quantize_scope():
+        qat_model = tfmot.quantization.keras.quantize_apply(annotated_model)
+
+    print("QAT model prepared (Middle Layers by Index).")
+    return qat_model, actual_percentage # Return QAT model and actual parameter percentage
+
+
 # --- Full INT8 Post-Training Quantization (Baseline - Keep as is) ---
 def quantize_activation_ptq(model):
     print("\n--- Starting Full INT8 Post-Training Quantization (PTQ Baseline) ---")
     save_path = 'model_activation_int8_ptq_keras_temp'
-    tflite_path = 'resnet_activation_int8_ptq.tflite'
+    tflite_path_out = 'resnet_activation_int8_ptq.tflite' # Use a different variable name here
     try:
         # Save the original FP32 model temporarily
         # Clean up previous saved model directory if it exists
@@ -692,7 +786,8 @@ def quantize_activation_ptq(model):
         model.save(save_path)
         print(f"Saved temporary Keras model for PTQ: {save_path}")
         # Convert using convert_to_tflite
-        success = convert_to_tflite(save_path, tflite_path)
+        # Pass the desired output path directly to convert_to_tflite
+        converted_tflite_path = convert_to_tflite(save_path, tflite_path_out)
 
         # Clean up temporary Keras model directory after conversion (optional but good practice)
         if os.path.exists(save_path):
@@ -703,10 +798,7 @@ def quantize_activation_ptq(model):
                  print(f"Error cleaning up temporary directory {save_path}: {clean_e}")
 
 
-        if success:
-            return tflite_path
-        else:
-            return None
+        return converted_tflite_path # Return the path generated by convert_to_tflite
     except Exception as e:
         print(f"Error saving or converting model for PTQ: {e}")
         import traceback
@@ -818,7 +910,8 @@ def evaluate_keras_model(model, test_images, test_labels):
         # Check if model is already compiled before compiling again
         if not hasattr(model, 'optimizer'):
              print("Compiling FP32 model for evaluation...")
-             model.compile(optimizer='adam', loss='sparse_categoricalCrossentropy', metrics=['accuracy'])
+             # Use the same optimizer setup as QAT for consistency if possible, but standard Adam is usually fine
+             model.compile(optimizer=tf.keras.optimizers.Adam(), loss='sparse_categoricalCrossentropy', metrics=['accuracy'])
 
 
         loss, accuracy = model.evaluate(test_images, test_labels, verbose=0)
@@ -837,8 +930,6 @@ if __name__ == "__main__":
         print("Base model was not loaded successfully. Cannot proceed.")
         exit() # Ensure script exits if model loading failed
 
-    # Dictionary to store paths of generated TFLite files for evaluation
-    generated_tflite_files = {}
     evaluation_results = {} # Store evaluation results by name
 
     # 1. Evaluate Original FP32 Model
@@ -846,57 +937,72 @@ if __name__ == "__main__":
     if fp32_accuracy is not None:
         evaluation_results['FP32_Base_Model'] = fp32_accuracy
 
-    # 2. Prepare, Fine-tune, and Convert Full QAT Model
-    # Need to clone the base model before applying quantize_model to avoid modifying the original
+    # 2. Prepare, Fine-tune, Save Keras, Convert, and Evaluate Full QAT Model
     print("\n--- Processing Full QAT ---")
+    # Need to clone the base model before applying quantize_model to avoid modifying the original
     base_model_for_full_qat = tf.keras.models.clone_model(base_model)
     base_model_for_full_qat.set_weights(base_model.get_weights()) # Copy weights
 
-    # Call the corrected prepare_qat_full
+    # Prepare QAT model
     qat_prepared_full, actual_percent_full = prepare_qat_full(base_model_for_full_qat) # Pass the cloned model
 
     if qat_prepared_full is not None:
          # Use actual percentage (should be near 100) in filename
          output_prefix = f'resnet_full_qat_{int(actual_percent_full*100)}percent'
-         tflite_path = finetune_and_convert_qat_model(
-             qat_prepared_full,
-             finetune_data,
-             finetune_labels,
-             test_images, # Pass test data for validation during fit
-             test_labels, # Pass test labels for validation during fit
-             output_prefix
+         # Fine-tune and Save Keras model
+         saved_keras_qat_path, keras_accuracy_qat_full = finetune_and_save_qat_keras_model( # Capture Keras accuracy
+              qat_prepared_full,
+              finetune_data, finetune_labels, test_images, test_labels, output_prefix
          )
-         if tflite_path:
-             generated_tflite_files['Full_INT8_QAT'] = tflite_path
+         if keras_accuracy_qat_full is not None: # Store Keras accuracy
+              evaluation_results['Full_INT8_QAT_Keras_FakeQuant'] = keras_accuracy_qat_full
+
+         # Convert Saved Keras model to TFLite
+         if saved_keras_qat_path:
+              tflite_path = convert_to_tflite(saved_keras_qat_path, f'{output_prefix}_qat.tflite')
+              # Evaluate the TFLite model
+              if tflite_path:
+                   tflite_accuracy = evaluate_tflite(tflite_path, test_images, test_labels)
+                   if tflite_accuracy is not None:
+                        evaluation_results['Full_INT8_QAT_TFLite'] = tflite_accuracy
+              else:
+                   print(f"{output_prefix} TFLite conversion failed.")
          else:
-             print("Full QAT TFLite conversion failed.")
+             print(f"{output_prefix} Keras model saving/fine-tuning failed.")
     else:
-        print("Full QAT preparation failed.")
+         print("Full QAT preparation failed.")
 
 
-    # 3. Prepare, Fine-tune, and Convert Selective QAT Models
-    print(f"\nStarting Selective QAT Procedures with Target Percentage: {TARGET_QUANT_PERCENTAGE*100:.0f}%")
+    # 3. Prepare, Fine-tune, Save Keras, Convert, and Evaluate Selective QAT Methods
+    print(f"\nStarting Selective QAT Procedures (Score-based with Target Percentage: {TARGET_QUANT_PERCENTAGE*100:.0f}% & Index-based Excluding {MIDDLE_EXCLUDE_PERCENT*100:.0f}% Start/End)")
 
     # L2 Norm Selective QAT
-    # Clone the base model for each selective method to start fresh
     print("\n--- Processing Selective L2 Norm QAT ---")
+    # Clone the base model for each selective method to start fresh
     base_model_for_l2_qat = tf.keras.models.clone_model(base_model)
     base_model_for_l2_qat.set_weights(base_model.get_weights()) # Copy weights
     qat_prepared_l2, actual_percent_l2 = prepare_qat_l2_percent(base_model_for_l2_qat, target_percentage=TARGET_QUANT_PERCENTAGE)
     if qat_prepared_l2 is not None:
          output_prefix = f'resnet_l2norm_qat_{int(actual_percent_l2*100)}percent'
-         tflite_path = finetune_and_convert_qat_model(
-             qat_prepared_l2,
-             finetune_data,
-             finetune_labels,
-             test_images, # Pass test data for validation during fit
-             test_labels, # Pass test labels for validation during fit
-             output_prefix
+         saved_keras_qat_path, keras_accuracy_qat_l2 = finetune_and_save_qat_keras_model( # Capture Keras accuracy
+              qat_prepared_l2,
+              finetune_data, finetune_labels, test_images, test_labels, output_prefix
          )
-         if tflite_path:
-             generated_tflite_files[f'Selective_L2_QAT_{int(actual_percent_l2*100)}Percent'] = tflite_path
+         if keras_accuracy_qat_l2 is not None: # Store Keras accuracy
+              evaluation_results[f'Selective_L2_QAT_{int(actual_percent_l2*100)}Percent_Keras_FakeQuant'] = keras_accuracy_qat_l2
+
+         # Convert Saved Keras model to TFLite
+         if saved_keras_qat_path:
+              tflite_path = convert_to_tflite(saved_keras_qat_path, f'{output_prefix}_qat.tflite')
+              # Evaluate the TFLite model
+              if tflite_path:
+                   tflite_accuracy = evaluate_tflite(tflite_path, test_images, test_labels)
+                   if tflite_accuracy is not None:
+                        evaluation_results[f'Selective_L2_QAT_{int(actual_percent_l2*100)}Percent_TFLite'] = tflite_accuracy
+              else:
+                   print(f"{output_prefix} TFLite conversion failed.")
          else:
-             print("Selective L2 QAT TFLite conversion failed.")
+              print(f"{output_prefix} Keras model saving/fine-tuning failed.")
     else:
         print("Selective L2 QAT preparation failed.")
 
@@ -907,18 +1013,25 @@ if __name__ == "__main__":
     qat_prepared_hessian, actual_percent_hessian = prepare_qat_hessian_percent(base_model_for_hessian_qat, target_percentage=TARGET_QUANT_PERCENTAGE)
     if qat_prepared_hessian is not None:
          output_prefix = f'resnet_hessian_qat_{int(actual_percent_hessian*100)}percent'
-         tflite_path = finetune_and_convert_qat_model(
-             qat_prepared_hessian,
-             finetune_data,
-             finetune_labels,
-             test_images, # Pass test data for validation during fit
-             test_labels, # Pass test labels for validation during fit
-             output_prefix
+         saved_keras_qat_path, keras_accuracy_qat_hessian = finetune_and_save_qat_keras_model( # Capture Keras accuracy
+              qat_prepared_hessian,
+              finetune_data, finetune_labels, test_images, test_labels, output_prefix
          )
-         if tflite_path:
-             generated_tflite_files[f'Selective_Hessian_QAT_{int(actual_percent_hessian*100)}Percent'] = tflite_path
+         if keras_accuracy_qat_hessian is not None: # Store Keras accuracy
+              evaluation_results[f'Selective_Hessian_QAT_{int(actual_percent_hessian*100)}Percent_Keras_FakeQuant'] = keras_accuracy_qat_hessian
+
+         # Convert Saved Keras model to TFLite
+         if saved_keras_qat_path:
+              tflite_path = convert_to_tflite(saved_keras_qat_path, f'{output_prefix}_qat.tflite')
+              # Evaluate the TFLite model
+              if tflite_path:
+                   tflite_accuracy = evaluate_tflite(tflite_path, test_images, test_labels)
+                   if tflite_accuracy is not None:
+                        evaluation_results[f'Selective_Hessian_QAT_{int(actual_percent_hessian*100)}Percent_TFLite'] = tflite_accuracy
+              else:
+                   print(f"{output_prefix} TFLite conversion failed.")
          else:
-             print("Selective Hessian QAT TFLite conversion failed.")
+              print(f"{output_prefix} Keras model saving/fine-tuning failed.")
     else:
         print("Selective Hessian QAT preparation failed.")
 
@@ -929,75 +1042,136 @@ if __name__ == "__main__":
     qat_prepared_hybrid, actual_percent_hybrid = prepare_qat_hybrid_percent(base_model_for_hybrid_qat, target_percentage=TARGET_QUANT_PERCENTAGE)
     if qat_prepared_hybrid is not None:
          output_prefix = f'resnet_hybrid_qat_{int(actual_percent_hybrid*100)}percent'
-         tflite_path = finetune_and_convert_qat_model(
-             qat_prepared_hybrid,
-             finetune_data,
-             finetune_labels,
-             test_images, # Pass test data for validation during fit
-             test_labels, # Pass test labels for validation during fit
-             output_prefix
+         saved_keras_qat_path, keras_accuracy_qat_hybrid = finetune_and_save_qat_keras_model( # Capture Keras accuracy
+              qat_prepared_hybrid,
+              finetune_data, finetune_labels, test_images, test_labels, output_prefix
          )
-         if tflite_path:
-             generated_tflite_files[f'Selective_Hybrid_QAT_{int(actual_percent_hybrid*100)}Percent'] = tflite_path
+         if keras_accuracy_qat_hybrid is not None: # Store Keras accuracy
+              evaluation_results[f'Selective_Hybrid_QAT_{int(actual_percent_hybrid*100)}Percent_Keras_FakeQuant'] = keras_accuracy_qat_hybrid
+
+         # Convert Saved Keras model to TFLite
+         if saved_keras_qat_path:
+              tflite_path = convert_to_tflite(saved_keras_qat_path, f'{output_prefix}_qat.tflite')
+              # Evaluate the TFLite model
+              if tflite_path:
+                   tflite_accuracy = evaluate_tflite(tflite_path, test_images, test_labels)
+                   if tflite_accuracy is not None:
+                        evaluation_results[f'Selective_Hybrid_QAT_{int(actual_percent_hybrid*100)}Percent_TFLite'] = tflite_accuracy
+              else:
+                   print(f"{output_prefix} TFLite conversion failed.")
          else:
-             print("Selective Hybrid QAT TFLite conversion failed.")
+              print(f"{output_prefix} Keras model saving/fine-tuning failed.")
     else:
         print("Selective Hybrid QAT preparation failed.")
 
+    # New: Middle Layers Selective QAT
+    print(f"\n--- Processing Selective Middle Layers QAT (Exclude {MIDDLE_EXCLUDE_PERCENT*100:.0f}% Start/End) ---")
+    base_model_for_middle_qat = tf.keras.models.clone_model(base_model)
+    base_model_for_middle_qat.set_weights(base_model.get_weights()) # Copy weights
+    qat_prepared_middle, actual_percent_middle = prepare_qat_middle_percent(base_model_for_middle_qat, exclude_percent=MIDDLE_EXCLUDE_PERCENT)
+    if qat_prepared_middle is not None:
+         output_prefix = f'resnet_middle_qat_{int(actual_percent_middle*100)}percent'
+         saved_keras_qat_path, keras_accuracy_qat_middle = finetune_and_save_qat_keras_model( # Capture Keras accuracy
+              qat_prepared_middle,
+              finetune_data, finetune_labels, test_images, test_labels, output_prefix
+         )
+         if keras_accuracy_qat_middle is not None: # Store Keras accuracy
+              evaluation_results[f'Selective_Middle_Layers_QAT_{int(actual_percent_middle*100)}Percent_Keras_FakeQuant'] = keras_accuracy_qat_middle
 
-    # 4. Prepare and Convert Full INT8 PTQ Model (Baseline)
-    # Clone the base model for PTQ to avoid any potential side effects
+         # Convert Saved Keras model to TFLite
+         if saved_keras_qat_path:
+              tflite_path = convert_to_tflite(saved_keras_qat_path, f'{output_prefix}_qat.tflite')
+              # Evaluate the TFLite model
+              if tflite_path:
+                   tflite_accuracy = evaluate_tflite(tflite_path, test_images, test_labels)
+                   if tflite_accuracy is not None:
+                        evaluation_results[f'Selective_Middle_Layers_QAT_{int(actual_percent_middle*100)}Percent_TFLite'] = tflite_accuracy
+              else:
+                   print(f"{output_prefix} TFLite conversion failed.")
+         else:
+              print(f"{output_prefix} Keras model saving/fine-tuning failed.")
+    else:
+        print("Selective Middle Layers QAT preparation failed.")
+
+
+    # 4. Full INT8 PTQ Process (Prepare -> Convert -> Evaluate)
     print("\n--- Processing Full INT8 PTQ ---")
     base_model_for_ptq = tf.keras.models.clone_model(base_model)
     base_model_for_ptq.set_weights(base_model.get_weights()) # Copy weights
-    ptq_tflite_path = quantize_activation_ptq(base_model_for_ptq) # Pass the cloned model
+    # This function saves Keras temp and converts to TFLite
+    ptq_tflite_path = quantize_activation_ptq(base_model_for_ptq)
 
+    # Evaluate the TFLite model
     if ptq_tflite_path:
-         generated_tflite_files['Full_INT8_PTQ'] = ptq_tflite_path # Add PTQ result to evaluation list
+         tflite_accuracy = evaluate_tflite(ptq_tflite_path, test_images, test_labels)
+         if tflite_accuracy is not None:
+              evaluation_results['Full_INT8_PTQ_TFLite'] = tflite_accuracy
     else:
-        print("Full INT8 PTQ conversion failed.")
+         print("Full INT8 PTQ conversion failed.")
 
 
-    # --- Evaluate all generated TFLite Models ---
-    print("\nStarting Evaluations of Generated TFLite Models...")
-    if generated_tflite_files:
-        for name, tflite_path in generated_tflite_files.items():
-             # Evaluate TFLite models and store accuracy in evaluation_results
-             # Accuracy for TFLite models is already calculated and printed by evaluate_tflite
-             # We just call it here to perform the evaluation for each file
-             accuracy = evaluate_tflite(tflite_path, test_images, test_labels)
-             if accuracy is not None:
-                 # Use the name from generated_tflite_files dictionary
-                 evaluation_results[name] = accuracy
-             else:
-                 evaluation_results[name] = None # Mark as failed evaluation
-    else:
-        print("No TFLite models were successfully generated for evaluation.")
-
-
+    # --- Summary of Results ---
     print("\n--- Summary of Results ---")
     if evaluation_results:
-        # Sort results for cleaner output
-        # Prioritize FP32, then Full QAT/PTQ, then Selective QATs by name
+        # Sort results for clearer output
+        # Prioritize FP32, then Full QAT/PTQ TFLite, then Selective QAT TFLite, then Keras FakeQuant results
         def sort_key(item):
             name = item[0]
             if name == 'FP32_Base_Model': return 0
-            if name == 'Full_INT8_PTQ': return 1
-            if name == 'Full_INT8_QAT': return 2
-            # Use a tuple for selective models to sort by percentage if needed, or just alphabetically
-            # Example: ('Selective_L2_QAT_71Percent', 3)
-            if name.startswith('Selective_'): return 3
-            return 4 # Fallback for unexpected names
+            if name == 'Full_INT8_PTQ_TFLite': return 1
+            if name == 'Full_INT8_QAT_TFLite': return 2
+            if name.endswith('_TFLite'): return 3 # All other TFLite results
+            if name.endswith('_Keras_FakeQuant'): return 4 # Keras FakeQuant results
+            return 5 # Fallback
 
-        sorted_results = dict(sorted(evaluation_results.items(), key=sort_key))
+        # Separate Keras and TFLite results for potentially clearer sorting/display
+        keras_results = {k:v for k,v in evaluation_results.items() if k.endswith('_Keras_FakeQuant')}
+        tflite_results = {k:v for k,v in evaluation_results.items() if k.endswith('_TFLite') or k == 'FP32_Base_Model'} # Include FP32 here
 
-        for name, acc in sorted_results.items():
-             if acc is not None:
-                 print(f"{name}: {acc*100:.2f}% Accuracy")
-             else:
-                 print(f"{name}: Evaluation Failed")
+
+        print("\n--- TFLite Model Accuracy ---")
+        if tflite_results:
+             # Sort TFLite results (FP32 first, then Full, then Selective)
+             def tflite_sort_key(item):
+                 name = item[0]
+                 if name == 'FP32_Base_Model': return 0
+                 if name == 'Full_INT8_PTQ_TFLite': return 1
+                 if name == 'Full_INT8_QAT_TFLite': return 2
+                 # Sort selective TFLite results alphabetically
+                 if name.endswith('_TFLite'): return 3 + ord(name[11]) # Sorts by first letter after Selective_
+                 return 10 # Should not happen
+
+             sorted_tflite_results = dict(sorted(tflite_results.items(), key=tflite_sort_key))
+             for name, acc in sorted_tflite_results.items():
+                  if acc is not None:
+                      print(f"{name}: {acc*100:.2f}% Accuracy")
+                  else:
+                      print(f"{name}: Evaluation Failed")
+        else:
+            print("(No TFLite models evaluated successfully)")
+
+
+        print("\n--- QAT Keras Model (Fake Quant) Accuracy ---")
+        if keras_results:
+             # Sort Keras FakeQuant results (Full first, then Selective by name)
+             def keras_sort_key(item):
+                  name = item[0]
+                  if name == 'Full_INT8_QAT_Keras_FakeQuant': return 0
+                  # Sort selective Keras results alphabetically
+                  if name.endswith('_Keras_FakeQuant'): return 1 + ord(name[11]) # Sorts by first letter after Selective_
+                  return 10 # Should not happen
+
+             sorted_keras_results = dict(sorted(keras_results.items(), key=keras_sort_key))
+             for name, acc in sorted_keras_results.items():
+                  if acc is not None:
+                      print(f"{name}: {acc*100:.2f}% Accuracy")
+                  else:
+                      print(f"{name}: Evaluation Failed")
+        else:
+            print("(No QAT Keras models evaluated successfully)")
+
     else:
         print("No models were successfully evaluated.")
 
 
-    print("\nComparison complete.")
+print("\nComparison complete.")
