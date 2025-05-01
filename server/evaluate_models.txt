@@ -1,0 +1,176 @@
+import tensorflow as tf
+import numpy as np
+import time
+import os
+from tensorflow.keras.datasets import cifar10
+import tensorflow_model_optimization as tfmot
+
+# Configuration
+TEST_SIZE = 1000  # Number of test images to evaluate
+NUM_RUNS = 100    # Number of runs for timing measurement
+
+def load_test_data():
+    """Load and prepare test data from CIFAR-10."""
+    (_, _), (x_test, y_test) = cifar10.load_data()
+    x_test = x_test.astype(np.float32) / 255.0
+    return x_test[:TEST_SIZE], y_test[:TEST_SIZE].flatten()
+
+def get_model_size(model_path):
+    """Get model size in MB."""
+    if os.path.exists(model_path):
+        return os.path.getsize(model_path) / (1024 * 1024)  # Convert to MB
+    return 0
+
+def evaluate_tflite_model(tflite_path, test_images, test_labels):
+    """Evaluate TFLite model accuracy and inference time."""
+    if not os.path.exists(tflite_path):
+        print(f"Model not found: {tflite_path}")
+        return None, None, None
+
+    try:
+        interpreter = tf.lite.Interpreter(model_path=tflite_path)
+        interpreter.allocate_tensors()
+
+        input_details = interpreter.get_input_details()[0]
+        output_details = interpreter.get_output_details()[0]
+
+        # Prepare input tensor
+        input_shape = input_details['shape']
+        input_is_int = np.issubdtype(input_details['dtype'], np.integer)
+
+        # Measure accuracy
+        correct = 0
+        inference_times = []
+
+        for i in range(len(test_images)):
+            img = test_images[i]
+            label = test_labels[i]
+            img_batch = np.expand_dims(img, axis=0)
+
+            if input_is_int:
+                scale, zero_point = input_details['quantization']
+                scale = scale if scale != 0 else 1e-8
+                inp = (img_batch / scale + zero_point).astype(input_details['dtype'])
+            else:
+                inp = img_batch.astype(input_details['dtype'])
+
+            # Measure inference time
+            start_time = time.time()
+            interpreter.set_tensor(input_details['index'], inp)
+            interpreter.invoke()
+            inference_time = time.time() - start_time
+            inference_times.append(inference_time)
+
+            output_data = interpreter.get_tensor(output_details['index'])
+
+            # Dequantize output if necessary
+            output_is_int = np.issubdtype(output_details['dtype'], np.integer)
+            if output_is_int:
+                scale, zero_point = output_details['quantization']
+                scale = scale if scale != 0 else 1e-8
+                dequantized_output = (output_data.astype(np.float32) - zero_point) * scale
+                pred = np.argmax(dequantized_output[0])
+            else:
+                pred = np.argmax(output_data[0])
+
+            if pred == label:
+                correct += 1
+
+        accuracy = correct / len(test_images)
+        avg_inference_time = np.mean(inference_times)
+        model_size = get_model_size(tflite_path)
+
+        return accuracy, avg_inference_time, model_size
+
+    except Exception as e:
+        print(f"Error evaluating model {tflite_path}: {e}")
+        return None, None, None
+
+def evaluate_keras_model(model_path, test_images, test_labels):
+    """Evaluate Keras model accuracy and inference time."""
+    try:
+        model = tf.keras.models.load_model(model_path)
+        
+        # Measure accuracy
+        correct = 0
+        inference_times = []
+
+        for i in range(len(test_images)):
+            img = test_images[i]
+            label = test_labels[i]
+            img_batch = np.expand_dims(img, axis=0)
+
+            # Measure inference time
+            start_time = time.time()
+            pred = model.predict(img_batch, verbose=0)
+            inference_time = time.time() - start_time
+            inference_times.append(inference_time)
+
+            if np.argmax(pred[0]) == label:
+                correct += 1
+
+        accuracy = correct / len(test_images)
+        avg_inference_time = np.mean(inference_times)
+        model_size = get_model_size(model_path)
+
+        return accuracy, avg_inference_time, model_size
+
+    except Exception as e:
+        print(f"Error evaluating model {model_path}: {e}")
+        return None, None, None
+
+def main():
+    # Load test data
+    print("Loading test data...")
+    test_images, test_labels = load_test_data()
+    print(f"Loaded {len(test_images)} test images")
+
+    # List of models to evaluate
+    models_to_evaluate = [
+        ('FP32 Base Model', 'resnet_fp32_saved_model', 'keras'),
+        ('Full INT8 PTQ', 'resnet_activation_int8_ptq.tflite', 'tflite'),
+        ('Full INT8 QAT', 'resnet_full_qat_100percent_qat.tflite', 'tflite'),
+        ('Selective L2 QAT', 'resnet_l2norm_qat_70percent_qat.tflite', 'tflite'),
+        ('Selective Hessian QAT', 'resnet_hessian_qat_70percent_qat.tflite', 'tflite'),
+        ('Selective Hybrid QAT', 'resnet_hybrid_qat_70percent_qat.tflite', 'tflite')
+    ]
+
+    # Results storage
+    results = []
+
+    # Evaluate each model
+    print("\nEvaluating models...")
+    for model_name, model_path, model_type in models_to_evaluate:
+        print(f"\nEvaluating {model_name}...")
+        
+        if model_type == 'tflite':
+            accuracy, inference_time, model_size = evaluate_tflite_model(model_path, test_images, test_labels)
+        else:  # keras
+            accuracy, inference_time, model_size = evaluate_keras_model(model_path, test_images, test_labels)
+
+        if accuracy is not None:
+            results.append({
+                'Model': model_name,
+                'Accuracy': accuracy * 100,  # Convert to percentage
+                'Inference Time (ms)': inference_time * 1000,  # Convert to milliseconds
+                'Model Size (MB)': model_size
+            })
+            print(f"Results for {model_name}:")
+            print(f"  Accuracy: {accuracy*100:.2f}%")
+            print(f"  Average Inference Time: {inference_time*1000:.2f} ms")
+            print(f"  Model Size: {model_size:.2f} MB")
+        else:
+            print(f"Failed to evaluate {model_name}")
+
+    # Print summary table
+    print("\n=== Summary of Results ===")
+    print("\nModel Performance Comparison:")
+    print("-" * 80)
+    print(f"{'Model Name':<25} {'Accuracy (%)':<15} {'Inference Time (ms)':<20} {'Model Size (MB)':<15}")
+    print("-" * 80)
+    
+    for result in results:
+        print(f"{result['Model']:<25} {result['Accuracy']:<15.2f} {result['Inference Time (ms)']:<20.2f} {result['Model Size (MB)']:<15.2f}")
+
+if __name__ == "__main__":
+    main() 
