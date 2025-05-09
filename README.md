@@ -1,5 +1,5 @@
 ### CNN 모델의 효율적 배포를 위한 양자화 학습 전략 비교 및 TFLite 변환 영향 분석
-#### Comparison of Quantization-Aware Training Strategies and Analysis of TFLite Conversion Effects for Efficient Deployment of CNN Models 
+Comparison of Quantization-Aware Training Strategies and Analysis of TFLite Conversion Effects for Efficient Deployment of CNN Models 
 
 ![슬라이드2](https://github.com/user-attachments/assets/d5783814-25d9-4a66-a79e-b05b470da92e)
 ![슬라이드3](https://github.com/user-attachments/assets/512f03b1-2b72-4149-b028-78ffd3cdb240)
